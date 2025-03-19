@@ -1,16 +1,24 @@
 package com.server;
 
 import java.io.*;
+import java.lang.classfile.attribute.SourceDebugExtensionAttribute;
 import java.net.*;
 
 public class OffshoreServer {
     private ServerSocket serverSocket;
     private int port = 8080;
+    private PrintWriter out;
+    private BufferedReader in;
+    private Socket clientSocket;
 
     public OffshoreServer() {
         try {
             serverSocket = new ServerSocket(port);
             System.out.println("Offshore Proxy Server started on port " + port);
+            clientSocket = serverSocket.accept();
+            out = new PrintWriter(clientSocket.getOutputStream(), true);
+            in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+            System.out.println("Established persistant connection");
             startListening();
         } catch (IOException e) {
             System.err.println("Could not listen on port " + port + ": " + e.getMessage());
