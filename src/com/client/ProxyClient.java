@@ -12,12 +12,16 @@ public class ProxyClient {
     private Socket serverSocket;
     private PrintWriter serverOut;
     private BufferedReader serverIn;
+    private OutputStream serverRawOut;
+    private InputStream serverRawIn;
 
     public ProxyClient() {
         try {
             serverSocket = new Socket(serverHost, serverPort);
             serverOut = new PrintWriter(serverSocket.getOutputStream(), true);
             serverIn = new BufferedReader(new InputStreamReader(serverSocket.getInputStream()));
+            serverRawOut = serverSocket.getOutputStream();
+            serverRawIn = serverSocket.getInputStream();
             System.out.println("Established persistent TCP connection to offshore proxy at " + serverHost + ":" + serverPort);
         } catch (IOException e) {
             System.err.println("Failed to connect to offshore proxy: " + e.getMessage());
@@ -44,7 +48,9 @@ public class ProxyClient {
 
     private void handleBrowserRequest(Socket clientSocket) {
         try (BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-             PrintWriter out = new PrintWriter(clientSocket.getOutputStream(), true)) {
+             PrintWriter out = new PrintWriter(clientSocket.getOutputStream(), true);
+             InputStream clientRawIn = clientSocket.getInputStream();
+             OutputStream clientRawOut = clientSocket.getOutputStream()) {
 
             String firstLine = in.readLine();
             if (firstLine == null) {
@@ -62,18 +68,13 @@ public class ProxyClient {
             String method = requestParts[0];
             String url = requestParts[1];
 
-
+            // Handle CONNECT requests (for HTTPS)
             if (method.equals("CONNECT")) {
-                System.out.println("Received CONNECT request for " + url + ". This proxy only supports HTTP GET requests.");
-                String response = "HTTP/1.1 400 Bad Request\r\n" +
-                        "Content-Type: text/plain\r\n" +
-                        "Content-Length: 29\r\n" +
-                        "\r\n" +
-                        "Proxy only supports HTTP GET\n";
-                out.println(response);
-                out.flush();
+                handleConnectRequest(url, clientSocket, in, out, clientRawIn, clientRawOut);
                 return;
             }
+
+            // Handle GET requests (for HTTP)
             if (!method.equals("GET")) {
                 System.err.println("Unsupported method: " + method);
                 String response = "HTTP/1.1 405 Method Not Allowed\r\n" +
@@ -85,18 +86,31 @@ public class ProxyClient {
                 out.flush();
                 return;
             }
+
+            // Ensure the URL has a protocol; if not, assume HTTP
             if (!url.startsWith("http://") && !url.startsWith("https://")) {
                 url = "http://" + url;
             }
+
+            // Add to queue for HTTP GET requests
             addRequest(url);
-            processRequests();
-            String response = "HTTP/1.1 200 OK\r\n" +
-                    "Content-Type: text/plain\r\n" +
-                    "Content-Length: 13\r\n" +
-                    "\r\n" +
-                    "Request Queued\n";
-            out.println(response);
-            out.flush();
+
+            // Process requests and get the response from the offshore proxy
+            String response = processRequests();
+
+            // Send the response back to the browser
+            if (response != null) {
+                out.print(response);
+                out.flush();
+            } else {
+                String errorResponse = "HTTP/1.1 502 Bad Gateway\r\n" +
+                        "Content-Type: text/plain\r\n" +
+                        "Content-Length: 23\r\n" +
+                        "\r\n" +
+                        "Failed to fetch webpage\n";
+                out.println(errorResponse);
+                out.flush();
+            }
 
         } catch (IOException e) {
             System.err.println("Error handling browser request: " + e.getMessage());
@@ -109,6 +123,83 @@ public class ProxyClient {
         }
     }
 
+    private void handleConnectRequest(String target, Socket clientSocket, BufferedReader clientIn, PrintWriter clientOut,
+                                      InputStream clientRawIn, OutputStream clientRawOut) {
+        try {
+            // Parse the target (e.g., "www.google.com:443")
+            String[] targetParts = target.split(":");
+            if (targetParts.length != 2) {
+                System.err.println("Invalid CONNECT target: " + target);
+                clientOut.println("HTTP/1.1 400 Bad Request\r\n" +
+                        "Content-Type: text/plain\r\n" +
+                        "Content-Length: 15\r\n" +
+                        "\r\n" +
+                        "Invalid target\n");
+                clientOut.flush();
+                return;
+            }
+            String host = targetParts[0];
+            int port = Integer.parseInt(targetParts[1]);
+
+            // Send a CONNECT request to the offshore proxy over the persistent connection
+            serverOut.println("CONNECT " + host + ":" + port);
+            serverOut.flush();
+
+            // Read the response from the offshore proxy
+            String response = serverIn.readLine();
+            if (response == null || !response.equals("OK")) {
+                System.err.println("Offshore proxy failed to establish connection: " + (response != null ? response : "No response"));
+                clientOut.println("HTTP/1.1 502 Bad Gateway\r\n" +
+                        "Content-Type: text/plain\r\n" +
+                        "Content-Length: 23\r\n" +
+                        "\r\n" +
+                        "Failed to fetch webpage\n");
+                clientOut.flush();
+                return;
+            }
+
+            // Send 200 Connection Established to the browser
+            clientOut.println("HTTP/1.1 200 Connection Established\r\n" +
+                    "Connection: close\r\n" +
+                    "\r\n");
+            clientOut.flush();
+
+            // Start relaying data between the browser and the offshore proxy
+            Thread clientToServer = new Thread(() -> {
+                try {
+                    relayData(clientRawIn, serverRawOut);
+                } catch (IOException e) {
+                    System.err.println("Error in client-to-server relay: " + e.getMessage());
+                }
+            });
+            Thread serverToClient = new Thread(() -> {
+                try {
+                    relayData(serverRawIn, clientRawOut);
+                } catch (IOException e) {
+                    System.err.println("Error in server-to-client relay: " + e.getMessage());
+                }
+            });
+            clientToServer.start();
+            serverToClient.start();
+
+            // Wait for both threads to finish
+            clientToServer.join();
+            serverToClient.join();
+
+        } catch (IOException | InterruptedException e) {
+            System.err.println("Error handling CONNECT request: " + e.getMessage());
+        }
+    }
+
+    private void relayData(InputStream in, OutputStream out) throws IOException {
+        byte[] buffer = new byte[4096];
+        int bytesRead;
+        while ((bytesRead = in.read(buffer)) != -1) {
+            out.write(buffer, 0, bytesRead);
+            out.flush();
+        }
+    }
+
     public void addRequest(String requestUrl) {
         try {
             requestQueue.put(requestUrl);
@@ -118,18 +209,19 @@ public class ProxyClient {
         }
     }
 
-    public void processRequests() {
+    public String processRequests() {
         while (!requestQueue.isEmpty()) {
             try {
                 String requestUrl = requestQueue.take();
-                sendRequestToProxy(requestUrl);
+                return sendRequestToProxy(requestUrl);
             } catch (InterruptedException e) {
                 System.err.println("Error processing queue: " + e.getMessage());
             }
         }
+        return null;
     }
 
-    private void sendRequestToProxy(String requestUrl) {
+    private String sendRequestToProxy(String requestUrl) {
         try {
             if (serverSocket.isClosed()) {
                 throw new IOException("Persistent connection to offshore proxy is closed.");
@@ -139,26 +231,52 @@ public class ProxyClient {
 
             // Send HTTP request over the persistent connection
             String request = "GET " + requestUrl + " HTTP/1.1\r\n" +
-                    "Host: " + new URL(requestUrl).getHost() + "\r\n" +
+                    "Host: " + host + "\r\n" +
                     "Connection: keep-alive\r\n" +
                     "\r\n";
             serverOut.println(request);
             serverOut.flush();
 
+            StringBuilder response = new StringBuilder();
             String responseLine;
             System.out.println("Response from offshore proxy for " + requestUrl + ":");
             while ((responseLine = serverIn.readLine()) != null) {
+                response.append(responseLine).append("\r\n");
                 System.out.println(responseLine);
                 if (responseLine.isEmpty()) {
                     break;
                 }
             }
-            System.out.println("Completed request for: " + requestUrl);
 
-        }catch (MalformedURLException e) {
+            String responseStr = response.toString();
+            int contentLength = -1;
+            for (String line : responseStr.split("\r\n")) {
+                if (line.toLowerCase().startsWith("content-length:")) {
+                    contentLength = Integer.parseInt(line.split(":")[1].trim());
+                    break;
+                }
+            }
+            if (contentLength > 0) {
+                char[] body = new char[contentLength];
+                int charsRead = serverIn.read(body, 0, contentLength);
+                if (charsRead != contentLength) {
+                    System.err.println("Incomplete body read: expected " + contentLength + " chars, got " + charsRead);
+                }
+                response.append(new String(body, 0, charsRead));
+            }
+            System.out.println("Completed request for: " + requestUrl);
+            return response.toString();
+
+        } catch (MalformedURLException e) {
             System.err.println("Invalid URL format: " + requestUrl + " - " + e.getMessage());
+            return "HTTP/1.1 400 Bad Request\r\n" +
+                    "Content-Type: text/plain\r\n" +
+                    "Content-Length: 15\r\n" +
+                    "\r\n" +
+                    "Invalid URL\n";
         } catch (IOException e) {
             System.err.println("Failed to send request to proxy: " + e.getMessage());
+            return null;
         }
     }
 }
