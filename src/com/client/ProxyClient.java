@@ -68,13 +68,24 @@ public class ProxyClient {
             String method = requestParts[0];
             String url = requestParts[1];
 
-            // Handle CONNECT requests (for HTTPS)
+
+            if (method.equals("CONNECT")) {
+                System.out.println("Received CONNECT request for " + url + ". This proxy only supports HTTP GET requests.");
+                String response = "HTTP/1.1 400 Bad Request\r\n" +
+                        "Content-Type: text/plain\r\n" +
+                        "Content-Length: 29\r\n" +
+                        "\r\n" +
+                        "Proxy only supports HTTP GET\n";
+                out.println(response);
+                out.flush();
+                return;
+            }
+
             if (method.equals("CONNECT")) {
                 handleConnectRequest(url, clientSocket, in, out, clientRawIn, clientRawOut);
                 return;
             }
 
-            // Handle GET requests (for HTTP)
             if (!method.equals("GET")) {
                 System.err.println("Unsupported method: " + method);
                 String response = "HTTP/1.1 405 Method Not Allowed\r\n" +
@@ -86,19 +97,11 @@ public class ProxyClient {
                 out.flush();
                 return;
             }
-
-            // Ensure the URL has a protocol; if not, assume HTTP
             if (!url.startsWith("http://") && !url.startsWith("https://")) {
                 url = "http://" + url;
             }
-
-            // Add to queue for HTTP GET requests
             addRequest(url);
-
-            // Process requests and get the response from the offshore proxy
             String response = processRequests();
-
-            // Send the response back to the browser
             if (response != null) {
                 out.print(response);
                 out.flush();
@@ -122,7 +125,6 @@ public class ProxyClient {
             }
         }
     }
-
     private void handleConnectRequest(String target, Socket clientSocket, BufferedReader clientIn, PrintWriter clientOut,
                                       InputStream clientRawIn, OutputStream clientRawOut) {
         try {
@@ -147,8 +149,8 @@ public class ProxyClient {
 
             // Read the response from the offshore proxy
             String response = serverIn.readLine();
-            if (response == null || !response.equals("OK")) {
-                System.err.println("Offshore proxy failed to establish connection: " + (response != null ? response : "No response"));
+            if (!response.equals("OK")) {
+                System.err.println("Offshore proxy failed to establish connection: " + response);
                 clientOut.println("HTTP/1.1 502 Bad Gateway\r\n" +
                         "Content-Type: text/plain\r\n" +
                         "Content-Length: 23\r\n" +
@@ -165,20 +167,8 @@ public class ProxyClient {
             clientOut.flush();
 
             // Start relaying data between the browser and the offshore proxy
-            Thread clientToServer = new Thread(() -> {
-                try {
-                    relayData(clientRawIn, serverRawOut);
-                } catch (IOException e) {
-                    System.err.println("Error in client-to-server relay: " + e.getMessage());
-                }
-            });
-            Thread serverToClient = new Thread(() -> {
-                try {
-                    relayData(serverRawIn, clientRawOut);
-                } catch (IOException e) {
-                    System.err.println("Error in server-to-client relay: " + e.getMessage());
-                }
-            });
+            Thread clientToServer = new Thread(() -> relayData(clientRawIn, serverRawOut));
+            Thread serverToClient = new Thread(() -> relayData(serverRawIn, clientRawOut));
             clientToServer.start();
             serverToClient.start();
 
@@ -191,15 +181,18 @@ public class ProxyClient {
         }
     }
 
-    private void relayData(InputStream in, OutputStream out) throws IOException {
-        byte[] buffer = new byte[4096];
-        int bytesRead;
-        while ((bytesRead = in.read(buffer)) != -1) {
-            out.write(buffer, 0, bytesRead);
-            out.flush();
+    private void relayData(InputStream in, OutputStream out) {
+        try {
+            byte[] buffer = new byte[4096];
+            int bytesRead;
+            while ((bytesRead = in.read(buffer)) != -1) {
+                out.write(buffer, 0, bytesRead);
+                out.flush();
+            }
+        } catch (IOException e) {
+            System.err.println("Error relaying data: " + e.getMessage());
         }
     }
-
     public void addRequest(String requestUrl) {
         try {
             requestQueue.put(requestUrl);
@@ -231,7 +224,7 @@ public class ProxyClient {
 
             // Send HTTP request over the persistent connection
             String request = "GET " + requestUrl + " HTTP/1.1\r\n" +
-                    "Host: " + host + "\r\n" +
+                    "Host: " + new URL(requestUrl).getHost() + "\r\n" +
                     "Connection: keep-alive\r\n" +
                     "\r\n";
             serverOut.println(request);
@@ -267,7 +260,7 @@ public class ProxyClient {
             System.out.println("Completed request for: " + requestUrl);
             return response.toString();
 
-        } catch (MalformedURLException e) {
+        }catch (MalformedURLException e) {
             System.err.println("Invalid URL format: " + requestUrl + " - " + e.getMessage());
             return "HTTP/1.1 400 Bad Request\r\n" +
                     "Content-Type: text/plain\r\n" +

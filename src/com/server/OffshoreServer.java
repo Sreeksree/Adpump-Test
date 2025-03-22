@@ -8,10 +8,11 @@ import java.net.*;
 public class OffshoreServer {
     private ServerSocket serverSocket;
     private int port = 8080;
-    private OutputStream out;
-    private InputStream in;
+    private PrintWriter out;
+    private BufferedReader in;
+    private OutputStream rawOut;
+    private InputStream rawIn;
     private Socket clientSocket;
-    private final Object lock = new Object(); // For synchronizing access to clientSocket streams
 
     public OffshoreServer() {
         System.setProperty("http.keepAlive", "true");
@@ -20,10 +21,12 @@ public class OffshoreServer {
             serverSocket = new ServerSocket(port);
             System.out.println("Offshore Proxy Server started on port " + port);
 
+
             clientSocket = serverSocket.accept();
-            clientSocket.setSoTimeout(30000); // 30-second timeout for socket operations
-            out = clientSocket.getOutputStream();
-            in = clientSocket.getInputStream();
+            out = new PrintWriter(clientSocket.getOutputStream(), true);
+            in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+            rawOut = clientSocket.getOutputStream();
+            rawIn = clientSocket.getInputStream();
             System.out.println("Established persistent connection with proxy client");
             startListening();
         } catch (IOException e) {
@@ -36,28 +39,10 @@ public class OffshoreServer {
         while (true) {
             try {
                 // Read the first line to determine the request type
-                ByteArrayOutputStream requestBuffer = new ByteArrayOutputStream();
-                byte[] buffer = new byte[4096];
-                int bytesRead;
-                boolean firstLineEnded = false;
-                String firstLine = null;
-
-                synchronized (lock) {
-                    while (!firstLineEnded) {
-                        bytesRead = in.read(buffer);
-                        if (bytesRead == -1) {
-                            System.out.println("No more data from proxy client. Closing connection.");
-                            return;
-                        }
-                        requestBuffer.write(buffer, 0, bytesRead);
-                        String currentData = requestBuffer.toString();
-                        int endOfLine = currentData.indexOf("\r\n");
-                        if (endOfLine != -1) {
-                            firstLine = currentData.substring(0, endOfLine);
-                            firstLineEnded = true;
-                            break;
-                        }
-                    }
+                String firstLine = in.readLine();
+                if (firstLine == null) {
+                    System.out.println("No more data from proxy client. Closing connection.");
+                    break;
                 }
 
                 // Handle CONNECT requests (for HTTPS)
@@ -69,26 +54,10 @@ public class OffshoreServer {
                 // Handle GET requests (for HTTP)
                 StringBuilder request = new StringBuilder();
                 request.append(firstLine).append("\r\n");
-                boolean headersEnded = false;
-
-                synchronized (lock) {
-                    while (!headersEnded) {
-                        bytesRead = in.read(buffer);
-                        if (bytesRead == -1) {
-                            throw new IOException("Unexpected end of stream while reading headers");
-                        }
-                        String chunk = new String(buffer, 0, bytesRead);
-                        request.append(chunk);
-                        requestBuffer.write(buffer, 0, bytesRead);
-
-                        int endOfHeaders = request.toString().indexOf("\r\n\r\n");
-                        if (endOfHeaders != -1) {
-                            headersEnded = true;
-                            break;
-                        }
-                    }
+                String inputLine;
+                while ((inputLine = in.readLine()) != null && !inputLine.isEmpty()) {
+                    request.append(inputLine).append("\r\n");
                 }
-
                 System.out.println("Received request from proxy client:\n" + request.toString());
 
                 // Parse the request to extract the target URL
@@ -109,10 +78,8 @@ public class OffshoreServer {
                 String response = fetchWebpage(targetUrl, request.toString());
 
                 // Send the response back to the proxy client
-                synchronized (lock) {
-                    out.write(response.getBytes());
-                    out.flush();
-                }
+                out.print(response);
+                out.flush();
 
             } catch (IOException e) {
                 System.err.println("Error handling client: " + e.getMessage());
@@ -135,19 +102,15 @@ public class OffshoreServer {
             String[] parts = connectLine.split(" ");
             if (parts.length != 2) {
                 System.err.println("Invalid CONNECT request: " + connectLine);
-                synchronized (lock) {
-                    out.write("ERROR\r\n".getBytes());
-                    out.flush();
-                }
+                out.println("ERROR");
+                out.flush();
                 return;
             }
             String[] targetParts = parts[1].split(":");
             if (targetParts.length != 2) {
                 System.err.println("Invalid CONNECT target: " + parts[1]);
-                synchronized (lock) {
-                    out.write("ERROR\r\n".getBytes());
-                    out.flush();
-                }
+                out.println("ERROR");
+                out.flush();
                 return;
             }
             String host = targetParts[0];
@@ -155,30 +118,23 @@ public class OffshoreServer {
 
             // Connect to the target server
             Socket targetSocket = new Socket(host, port);
-            targetSocket.setSoTimeout(30000); // 30-second timeout for target socket
             System.out.println("Connected to target server: " + host + ":" + port);
 
             // Send OK to the proxy client to indicate successful connection
-            synchronized (lock) {
-                out.write("OK\r\n".getBytes());
-                out.flush();
-            }
+            out.println("OK");
+            out.flush();
 
             // Start relaying data between the proxy client and the target server
             Thread clientToTarget = new Thread(() -> {
                 try {
-                    synchronized (lock) {
-                        relayData(in, targetSocket.getOutputStream());
-                    }
+                    relayData(rawIn, targetSocket.getOutputStream());
                 } catch (IOException e) {
                     System.err.println("Error in client-to-target relay: " + e.getMessage());
                 }
             });
             Thread targetToClient = new Thread(() -> {
                 try {
-                    synchronized (lock) {
-                        relayData(targetSocket.getInputStream(), out);
-                    }
+                    relayData(targetSocket.getInputStream(), rawOut);
                 } catch (IOException e) {
                     System.err.println("Error in target-to-client relay: " + e.getMessage());
                 }
@@ -195,33 +151,23 @@ public class OffshoreServer {
 
         } catch (IOException | InterruptedException e) {
             System.err.println("Error handling CONNECT request: " + e.getMessage());
-            synchronized (lock) {
-                try {
-                    out.write("ERROR\r\n".getBytes());
-                    out.flush();
-                } catch (IOException ex) {
-                    System.err.println("Error sending ERROR response: " + ex.getMessage());
-                }
-            }
+            out.println("ERROR");
+            out.flush();
         }
     }
 
-    private void relayData(@NotNull InputStream in, OutputStream out) throws IOException {
-        byte[] buffer = new byte[4096];
-        int bytesRead;
+    private void relayData(@NotNull InputStream in, OutputStream out) {
         try {
+            byte[] buffer = new byte[4096];
+            int bytesRead;
             while ((bytesRead = in.read(buffer)) != -1) {
                 out.write(buffer, 0, bytesRead);
                 out.flush();
             }
         } catch (IOException e) {
-            // Only log the error if it's not a normal socket closure
-            if (!e.getMessage().contains("Socket closed")) {
-                throw e;
-            }
+            System.err.println("Error relaying data: " + e.getMessage());
         }
     }
-
     private @NotNull String fetchWebpage(String targetUrl, String clientRequest) {
         try {
             // Parse the target URL
@@ -230,26 +176,31 @@ public class OffshoreServer {
             int port = url.getPort() == -1 ? 80 : url.getPort(); // Default to port 80 for HTTP
 
             // Connect to the target web server
-            try (Socket targetSocket = new Socket(host, port)) {
-                targetSocket.setSoTimeout(30000); // 30-second timeout for target socket
-                OutputStream targetOut = targetSocket.getOutputStream();
-                InputStream targetIn = targetSocket.getInputStream();
+            try (Socket targetSocket = new Socket(host, port);
+                 PrintWriter targetOut = new PrintWriter(targetSocket.getOutputStream(), true);
+                 BufferedReader targetIn = new BufferedReader(new InputStreamReader(targetSocket.getInputStream()))) {
 
                 // Forward the original request to the target server
-                targetOut.write(clientRequest.getBytes());
+                targetOut.print(clientRequest);
                 targetOut.flush();
 
                 // Read the response from the target server
-                ByteArrayOutputStream responseBuffer = new ByteArrayOutputStream();
-                byte[] buffer = new byte[4096];
-                int bytesRead;
-                while ((bytesRead = targetIn.read(buffer)) != -1) {
-                    responseBuffer.write(buffer, 0, bytesRead);
+                StringBuilder response = new StringBuilder();
+                String line;
+                while ((line = targetIn.readLine()) != null) {
+                    response.append(line).append("\r\n");
                 }
 
-                String response = responseBuffer.toString();
-                System.out.println("Received response from target server (" + host + "):\n" + response);
-                return response;
+                System.out.println("Received response from target server (" + host + "):\n" + response.toString());
+                return response.toString();
+
+            } catch (IOException e) {
+                System.err.println("Error fetching webpage from " + host + ": " + e.getMessage());
+                return "HTTP/1.1 502 Bad Gateway\r\n" +
+                        "Content-Type: text/plain\r\n" +
+                        "Content-Length: 23\r\n" +
+                        "\r\n" +
+                        "Failed to fetch webpage\n";
             }
 
         } catch (MalformedURLException e) {
@@ -259,13 +210,6 @@ public class OffshoreServer {
                     "Content-Length: 15\r\n" +
                     "\r\n" +
                     "Invalid URL\n";
-        } catch (IOException e) {
-            System.err.println("Error fetching webpage from target: " + e.getMessage());
-            return "HTTP/1.1 502 Bad Gateway\r\n" +
-                    "Content-Type: text/plain\r\n" +
-                    "Content-Length: 23\r\n" +
-                    "\r\n" +
-                    "Failed to fetch webpage\n";
         }
     }
 }
