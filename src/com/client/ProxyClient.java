@@ -69,17 +69,17 @@ public class ProxyClient {
             String url = requestParts[1];
 
 
-            if (method.equals("CONNECT")) {
-                System.out.println("Received CONNECT request for " + url + ". This proxy only supports HTTP GET requests.");
-                String response = "HTTP/1.1 400 Bad Request\r\n" +
-                        "Content-Type: text/plain\r\n" +
-                        "Content-Length: 29\r\n" +
-                        "\r\n" +
-                        "Proxy only supports HTTP GET\n";
-                out.println(response);
-                out.flush();
-                return;
-            }
+//            if (method.equals("CONNECT")) {
+//                System.out.println("Received CONNECT request for " + url + ". This proxy only supports HTTP GET requests.");
+//                String response = "HTTP/1.1 400 Bad Request\r\n" +
+//                        "Content-Type: text/plain\r\n" +
+//                        "Content-Length: 29\r\n" +
+//                        "\r\n" +
+//                        "Proxy only supports HTTP GET\n";
+//                out.println(response);
+//                out.flush();
+//                return;
+//            }
 
             if (method.equals("CONNECT")) {
                 handleConnectRequest(url, clientSocket, in, out, clientRawIn, clientRawOut);
