@@ -2,12 +2,16 @@ package com.client;
 
 import java.io.*;
 import java.net.*;
+import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class ProxyClient {
     private String serverHost = "127.0.0.1";
     private int serverPort = 8080;
     private LinkedBlockingQueue<String> requestQueue = new LinkedBlockingQueue<>();
+    private Map<String, String> requestIdToUrl = new ConcurrentHashMap<>(); // Map request ID to URL
+    private AtomicLong requestIdCounter = new AtomicLong(0); // For generating unique request IDs
     private int clientPort = 8081;
     private Socket serverSocket;
     private PrintWriter serverOut;
@@ -195,8 +199,10 @@ public class ProxyClient {
     }
     public void addRequest(String requestUrl) {
         try {
-            requestQueue.put(requestUrl);
-            System.out.println("Added request: " + requestUrl + " to queue.");
+            String requestId = String.valueOf(requestIdCounter.incrementAndGet());
+            requestQueue.put(requestId + "|" + requestUrl); // Store request ID with URL
+            requestIdToUrl.put(requestId, requestUrl);
+            System.out.println("Added request (ID: " + requestId + "): " + requestUrl + " to queue.");
         } catch (InterruptedException e) {
             System.err.println("Failed to queue request: " + e.getMessage());
         }
@@ -205,8 +211,17 @@ public class ProxyClient {
     public String processRequests() {
         while (!requestQueue.isEmpty()) {
             try {
-                String requestUrl = requestQueue.take();
-                return sendRequestToProxy(requestUrl);
+                String requestEntry = requestQueue.take();
+                String[] parts = requestEntry.split("\\|", 2);
+                if (parts.length != 2) {
+                    System.err.println("Invalid request entry in queue: " + requestEntry);
+                    continue;
+                }
+                String requestId = parts[0];
+                String requestUrl = parts[1];
+                String response = sendRequestToProxy(requestId, requestUrl);
+                requestIdToUrl.remove(requestId); // Clean up after processing
+                return response;
             } catch (InterruptedException e) {
                 System.err.println("Error processing queue: " + e.getMessage());
             }
@@ -214,31 +229,69 @@ public class ProxyClient {
         return null;
     }
 
-    private String sendRequestToProxy(String requestUrl) {
+    private String sendRequestToProxy(String requestId, String requestUrl) {
         try {
             if (serverSocket.isClosed()) {
-                throw new IOException("Persistent connection to offshore proxy is closed.");
+                System.out.println("Persistent connection closed. Attempting to reconnect...");
+                reconnectToServer();
+                if (serverSocket.isClosed()) {
+                    throw new IOException("Failed to reconnect to offshore proxy.");
+                }
             }
+            serverSocket.setSoTimeout(15000); // 15-second read timeout
+
             URL url = new URL(requestUrl);
             String host = url.getHost();
 
-            // Send HTTP request over the persistent connection
             String request = "GET " + requestUrl + " HTTP/1.1\r\n" +
-                    "Host: " + new URL(requestUrl).getHost() + "\r\n" +
+                    "Host: " + host + "\r\n" +
+                    "X-Request-ID: " + requestId + "\r\n" +
                     "Connection: keep-alive\r\n" +
                     "\r\n";
+            System.out.println("Sending request to offshore proxy (ID: " + requestId + "):\n" + request);
             serverOut.println(request);
             serverOut.flush();
+            if (serverOut.checkError()) {
+                System.err.println("Error sending request to offshore proxy (ID: " + requestId + ")");
+                reconnectToServer();
+                throw new IOException("Failed to send request to offshore proxy.");
+            }
 
             StringBuilder response = new StringBuilder();
             String responseLine;
-            System.out.println("Response from offshore proxy for " + requestUrl + ":");
-            while ((responseLine = serverIn.readLine()) != null) {
-                response.append(responseLine).append("\r\n");
-                System.out.println(responseLine);
-                if (responseLine.isEmpty()) {
-                    break;
+            String responseRequestId = null;
+            System.out.println("Response from offshore proxy for " + requestUrl + " (ID: " + requestId + "):");
+            try {
+                while ((responseLine = serverIn.readLine()) != null) {
+                    response.append(responseLine).append("\r\n");
+                    System.out.println(responseLine);
+                    if (responseLine.startsWith("X-Request-ID:")) {
+                        responseRequestId = responseLine.split(":", 2)[1].trim();
+                    }
+                    if (responseLine.isEmpty()) {
+                        break;
+                    }
                 }
+            } catch (SocketTimeoutException e) {
+                System.err.println("Timeout while reading response from offshore proxy for request ID " + requestId + ": " + e.getMessage());
+                return "HTTP/1.1 504 Gateway Timeout\r\n" +
+                        "Content-Type: text/plain\r\n" +
+                        "Content-Length: 24\r\n" +
+                        "\r\n" +
+                        "Gateway timeout occurred";
+            } catch (IOException e) {
+                System.err.println("Error reading response from offshore proxy for request ID " + requestId + ": " + e.getMessage());
+                reconnectToServer();
+                throw e;
+            }
+
+            if (responseRequestId == null || !responseRequestId.equals(requestId)) {
+                System.err.println("Received response with mismatched or missing request ID. Expected: " + requestId + ", Got: " + responseRequestId);
+                return "HTTP/1.1 504 Gateway Timeout\r\n" +
+                        "Content-Type: text/plain\r\n" +
+                        "Content-Length: 24\r\n" +
+                        "\r\n" +
+                        "Gateway timeout occurred";
             }
 
             String responseStr = response.toString();
@@ -257,19 +310,32 @@ public class ProxyClient {
                 }
                 response.append(new String(body, 0, charsRead));
             }
+            System.out.println("Full response from offshore proxy (ID: " + requestId + "):\n" + response.toString());
             System.out.println("Completed request for: " + requestUrl);
             return response.toString();
 
-        }catch (MalformedURLException e) {
+        } catch (MalformedURLException e) {
             System.err.println("Invalid URL format: " + requestUrl + " - " + e.getMessage());
             return "HTTP/1.1 400 Bad Request\r\n" +
                     "Content-Type: text/plain\r\n" +
                     "Content-Length: 15\r\n" +
                     "\r\n" +
-                    "Invalid URL\n";
+                    "Invalid URL";
         } catch (IOException e) {
             System.err.println("Failed to send request to proxy: " + e.getMessage());
             return null;
         }
+    }
+
+    private void reconnectToServer() throws IOException {
+        if (serverSocket != null && !serverSocket.isClosed()) {
+            serverSocket.close();
+        }
+        serverSocket = new Socket(serverHost, serverPort);
+        serverOut = new PrintWriter(serverSocket.getOutputStream(), true);
+        serverIn = new BufferedReader(new InputStreamReader(serverSocket.getInputStream()));
+        serverRawOut = serverSocket.getOutputStream();
+        serverRawIn = serverSocket.getInputStream();
+        System.out.println("Re-established persistent TCP connection to offshore proxy at " + serverHost + ":" + serverPort);
     }
 }

@@ -35,32 +35,31 @@ public class OffshoreServer {
     }
 
     private void startListening() {
-        // Use the single persistent connection to handle all requests
         while (true) {
             try {
-                // Read the first line to determine the request type
                 String firstLine = in.readLine();
                 if (firstLine == null) {
                     System.out.println("No more data from proxy client. Closing connection.");
                     break;
                 }
 
-                // Handle CONNECT requests (for HTTPS)
                 if (firstLine.startsWith("CONNECT")) {
                     handleConnectRequest(firstLine);
                     continue;
                 }
 
-                // Handle GET requests (for HTTP)
                 StringBuilder request = new StringBuilder();
                 request.append(firstLine).append("\r\n");
+                String requestId = null;
                 String inputLine;
                 while ((inputLine = in.readLine()) != null && !inputLine.isEmpty()) {
                     request.append(inputLine).append("\r\n");
+                    if (inputLine.startsWith("X-Request-ID:")) {
+                        requestId = inputLine.split(":", 2)[1].trim();
+                    }
                 }
-                System.out.println("Received request from proxy client:\n" + request.toString());
+                System.out.println("Received request from proxy client (ID: " + requestId + "):\n" + request.toString());
 
-                // Parse the request to extract the target URL
                 String[] requestLines = request.toString().split("\r\n");
                 if (requestLines.length == 0) {
                     System.err.println("Empty request received.");
@@ -74,12 +73,17 @@ public class OffshoreServer {
                 String method = requestLineParts[0];
                 String targetUrl = requestLineParts[1];
 
-                // Fetch the webpage from the target server
                 String response = fetchWebpage(targetUrl, request.toString());
-
-                // Send the response back to the proxy client
+                if (requestId != null) {
+                    response = "X-Request-ID: " + requestId + "\r\n" + response;
+                }
+                System.out.println("Sending response to proxy client (ID: " + requestId + "):\n" + response);
                 out.print(response);
                 out.flush();
+                if (out.checkError()) {
+                    System.err.println("Error sending response to proxy client (ID: " + requestId + ")");
+                    break;
+                }
 
             } catch (IOException e) {
                 System.err.println("Error handling client: " + e.getMessage());
@@ -87,7 +91,6 @@ public class OffshoreServer {
             }
         }
 
-        // Clean up when the loop exits (connection closed)
         try {
             clientSocket.close();
             serverSocket.close();
@@ -170,25 +173,51 @@ public class OffshoreServer {
     }
     private @NotNull String fetchWebpage(String targetUrl, String clientRequest) {
         try {
-            // Parse the target URL
             URL url = new URL(targetUrl);
             String host = url.getHost();
-            int port = url.getPort() == -1 ? 80 : url.getPort(); // Default to port 80 for HTTP
+            int port = url.getPort() == -1 ? 80 : url.getPort();
 
-            // Connect to the target web server
-            try (Socket targetSocket = new Socket(host, port);
-                 PrintWriter targetOut = new PrintWriter(targetSocket.getOutputStream(), true);
+            Socket targetSocket = null;
+            try {
+                targetSocket = new Socket();
+                targetSocket.connect(new InetSocketAddress(host, port), 5000);
+                targetSocket.setSoTimeout(10000);
+            } catch (IOException e) {
+                System.err.println("Error connecting to target server " + host + ":" + port + ": " + e.getMessage());
+                if (targetSocket != null) {
+                    try {
+                        targetSocket.close();
+                    } catch (IOException closeException) {
+                        System.err.println("Error closing target socket: " + closeException.getMessage());
+                    }
+                }
+                return "HTTP/1.1 502 Bad Gateway\r\n" +
+                        "Content-Type: text/plain\r\n" +
+                        "Content-Length: 23\r\n" +
+                        "\r\n" +
+                        "Failed to fetch webpage";
+            }
+
+            try (PrintWriter targetOut = new PrintWriter(targetSocket.getOutputStream(), true);
                  BufferedReader targetIn = new BufferedReader(new InputStreamReader(targetSocket.getInputStream()))) {
 
-                // Forward the original request to the target server
+                System.out.println("Sending request to target server (" + host + "):\n" + clientRequest);
                 targetOut.print(clientRequest);
                 targetOut.flush();
 
-                // Read the response from the target server
                 StringBuilder response = new StringBuilder();
                 String line;
-                while ((line = targetIn.readLine()) != null) {
-                    response.append(line).append("\r\n");
+                try {
+                    while ((line = targetIn.readLine()) != null) {
+                        response.append(line).append("\r\n");
+                    }
+                } catch (SocketTimeoutException e) {
+                    System.err.println("Timeout while reading response from " + host + ": " + e.getMessage());
+                    return "HTTP/1.1 504 Gateway Timeout\r\n" +
+                            "Content-Type: text/plain\r\n" +
+                            "Content-Length: 24\r\n" +
+                            "\r\n" +
+                            "Gateway timeout occurred";
                 }
 
                 System.out.println("Received response from target server (" + host + "):\n" + response.toString());
@@ -200,7 +229,13 @@ public class OffshoreServer {
                         "Content-Type: text/plain\r\n" +
                         "Content-Length: 23\r\n" +
                         "\r\n" +
-                        "Failed to fetch webpage\n";
+                        "Failed to fetch webpage";
+            } finally {
+                try {
+                    targetSocket.close();
+                } catch (IOException e) {
+                    System.err.println("Error closing target socket: " + e.getMessage());
+                }
             }
 
         } catch (MalformedURLException e) {
@@ -209,7 +244,7 @@ public class OffshoreServer {
                     "Content-Type: text/plain\r\n" +
                     "Content-Length: 15\r\n" +
                     "\r\n" +
-                    "Invalid URL\n";
+                    "Invalid URL";
         }
     }
 }
